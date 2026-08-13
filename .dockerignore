@@ -1,0 +1,14 @@
+.git
+.gitignore
+.github
+*.mp4
+*.mov
+*.mkv
+*.avi
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
