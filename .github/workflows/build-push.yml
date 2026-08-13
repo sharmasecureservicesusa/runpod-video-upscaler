@@ -49,7 +49,6 @@ jobs:
             ghcr.io/${{ github.repository }}:latest
             ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
 
-
       - name: Update RunPod Serverless Template
         env:
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
