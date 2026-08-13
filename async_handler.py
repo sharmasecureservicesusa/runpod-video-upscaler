@@ -167,11 +167,17 @@ def process_video_sync(job_input: dict) -> dict:
     output_video = work_dir / "output.mp4"
 
     try:
-        # 1. Download chunk
+        # 1. Download input chunk with HTTP error checking
         res = requests.get(video_url, stream=True)
+        res.raise_for_status() # Raises exception if status code is 4xx/5xx
+        
         with open(input_video, "wb") as f:
             for chunk in res.iter_content(chunk_size=8192):
                 f.write(chunk)
+
+        # Verify downloaded file size is non-zero
+        if not input_video.exists() or input_video.stat().st_size == 0:
+            raise ValueError(f"Downloaded chunk '{input_video}' is empty or missing.")
 
         # 2. Extract dimensions and FPS
         in_w, in_h, fps = get_video_info(input_video)

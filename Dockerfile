@@ -30,6 +30,7 @@ RUN pip install --no-cache-dir \
 # 4. Install BasicSR and RealESRGAN without dependencies
 RUN pip install --no-cache-dir --no-deps basicsr
 RUN pip install --no-cache-dir --no-deps realesrgan
+RUN python -c "import site, os; p = os.path.join(site.getsitepackages()[0], 'basicsr', 'data', 'degradations.py'); open(p, 'w').write(open(p).read().replace('functional_tensor', 'functional'))" || true
 
 # 5. Lock NumPy to 1.26.4
 RUN pip uninstall -y numpy && pip install --force-reinstall --no-cache-dir "numpy==1.26.4"
