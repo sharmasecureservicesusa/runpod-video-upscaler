@@ -20,7 +20,10 @@ from realesrgan import RealESRGANer
 
 executor = ThreadPoolExecutor(max_workers=1)
 
-print("Loading Real-ESRGAN Model into VRAM...")
+# Global MongoDB Client instance for connection reuse
+mongo_client = None
+
+print("Loading Real-ESRGAN Model into VRAM...", flush=True)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
 upsampler = RealESRGANer(
@@ -33,7 +36,14 @@ upsampler = RealESRGANer(
     half=True if torch.cuda.is_available() else False,
     device=device
 )
-print("Real-ESRGAN Loaded Successfully!")
+print("Real-ESRGAN Loaded Successfully!", flush=True)
+
+
+def get_mongo_client(mongo_uri: str) -> MongoClient:
+    global mongo_client
+    if mongo_client is None:
+        mongo_client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
+    return mongo_client
 
 
 def get_video_info(video_path: Path):
@@ -122,7 +132,7 @@ def update_atlas_and_check_completion(job_input: dict):
     chunk_index = str(job_input["chunk_index"])
     mongo_uri = job_input["mongo_uri"]
 
-    client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
+    client = get_mongo_client(mongo_uri)
     db = client.get_database("video_upscaler")
     jobs_col = db.get_collection("jobs")
 
@@ -140,18 +150,23 @@ def update_atlas_and_check_completion(job_input: dict):
     total_chunks = updated_doc.get("total_chunks", 0)
     print(f"Job '{job_id}' Progress: {completed_count}/{total_chunks} chunks completed.", flush=True)
 
-    # Trigger reassembly if this worker instance finished the final chunk
-    if completed_count >= total_chunks and updated_doc.get("status") != "REASSEMBLING":
-        jobs_col.update_one({"_id": job_id}, {"$set": {"status": "REASSEMBLING"}})
-        print(f"=== ALL CHUNKS COMPLETED FOR {job_id}! Triggering Reassembler Cloud Run Job... ===", flush=True)
-        
-        trigger_gcp_reassemble_job(
-            gcp_project=job_input["gcp_project"],
-            gcp_region=job_input["gcp_region"],
-            reassemble_job_name=job_input["reassemble_job_name"],
-            video_id=job_id,
-            sa_key_json=job_input.get("gcp_sa_key_json", "")
+    # Check if all chunks are completed
+    if completed_count >= total_chunks:
+        # Atomic lock claiming: only ONE worker flips status from non-REASSEMBLING to REASSEMBLING
+        lock_doc = jobs_col.find_one_and_update(
+            {"_id": job_id, "status": {"$ne": "REASSEMBLING"}},
+            {"$set": {"status": "REASSEMBLING"}},
+            return_document=ReturnDocument.AFTER
         )
+        if lock_doc:
+            print(f"=== ALL CHUNKS COMPLETED FOR {job_id}! Triggering Reassembler Cloud Run Job... ===", flush=True)
+            trigger_gcp_reassemble_job(
+                gcp_project=job_input["gcp_project"],
+                gcp_region=job_input["gcp_region"],
+                reassemble_job_name=job_input["reassemble_job_name"],
+                video_id=job_id,
+                sa_key_json=job_input.get("gcp_sa_key_json", "")
+            )
 
 
 def process_video_sync(job_input: dict) -> dict:
@@ -166,23 +181,25 @@ def process_video_sync(job_input: dict) -> dict:
     input_video = work_dir / "input.mp4"
     output_video = work_dir / "output.mp4"
 
+    reader = None
+    writer = None
+
     try:
         # 1. Download input chunk with HTTP error checking
         res = requests.get(video_url, stream=True)
-        res.raise_for_status() # Raises exception if status code is 4xx/5xx
-        
+        res.raise_for_status()
+
         with open(input_video, "wb") as f:
             for chunk in res.iter_content(chunk_size=8192):
                 f.write(chunk)
 
-        # Verify downloaded file size is non-zero
         if not input_video.exists() or input_video.stat().st_size == 0:
             raise ValueError(f"Downloaded chunk '{input_video}' is empty or missing.")
 
         # 2. Extract dimensions and FPS
         in_w, in_h, fps = get_video_info(input_video)
 
-        # 3. Scale calculation capped at 4K
+        # 3. Calculate effective scale capped at 4K
         max_w, max_h = 3840, 2160
         max_allowed_scale = min(max_w / in_w, max_h / in_h)
         effective_scale = min(float(requested_scale), max_allowed_scale)
@@ -248,13 +265,18 @@ def process_video_sync(job_input: dict) -> dict:
         return {"upscaled_video_url": output_url}
 
     finally:
+        # Clean up FFmpeg subprocesses if still running on exception
+        if reader and reader.poll() is None:
+            reader.kill()
+        if writer and writer.poll() is None:
+            writer.kill()
+
         if work_dir.exists():
             shutil.rmtree(work_dir)
 
 
 async def async_handler(job):
     job_input = job["input"]
-
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(executor, process_video_sync, job_input)
     return result
