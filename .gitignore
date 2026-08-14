@@ -1,0 +1,28 @@
+# Local Virtual Environments
+venv/
+.venv/
+env/
+
+# Python Cache & Compiled Files
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Local Test Videos & Output Folders
+*.mp4
+*.mov
+*.mkv
+*.avi
+/tmp/
+workspace_temp/
+
+# Model Weights (Pre-downloaded in Dockerfile layer)
+/weights/
+*.pth
+*.onnx
+
+# Local Secrets & Credentials
+.env
+sa_key.json
+*.json
