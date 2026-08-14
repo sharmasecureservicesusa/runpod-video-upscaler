@@ -81,37 +81,30 @@ def get_video_info(input_video_path: str):
         ) from e
 
 
-def upload_to_s3(file_path: str, destination_filename: str, job_input: dict) -> str:
-    """Uploads the output video to S3 storage and returns its accessible URL."""
-    # Reads environment variables first, falls back to job payload inputs
-    s3_bucket = job_input.get("S3_BUCKET") or os.environ.get("S3_BUCKET")
-    aws_access_key = job_input.get("AWS_ACCESS_KEY_ID") or os.environ.get("AWS_ACCESS_KEY_ID")
-    aws_secret_key = job_input.get("AWS_SECRET_ACCESS_KEY") or os.environ.get("AWS_SECRET_ACCESS_KEY")
-    aws_endpoint_url = job_input.get("AWS_ENDPOINT_URL") or os.environ.get("AWS_ENDPOINT_URL")
-    aws_region = job_input.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+def upload_to_s3(local_path: str, s3_key: str, job_input: dict) -> str:
+    bucket = job_input.get("s3_bucket") or os.getenv("S3_BUCKET")
+    endpoint_url = job_input.get("s3_endpoint_url") or os.getenv("S3_ENDPOINT_URL", "https://storage.eu-north1.nebius.cloud:443")
+    key_id = job_input.get("aws_access_key_id") or os.getenv("AWS_ACCESS_KEY_ID")
+    secret_key = job_input.get("aws_secret_access_key") or os.getenv("AWS_SECRET_ACCESS_KEY")
+    region = job_input.get("aws_region") or os.getenv("AWS_REGION", "eu-north1")
 
-    if not s3_bucket:
-        raise ValueError(
-            "S3_BUCKET was not provided in job payload or environment variables."
-        )
+    if not bucket:
+        raise ValueError("S3_BUCKET was not provided in job payload or environment variables.")
 
-    s3_client = boto3.client(
+    client = boto3.client(
         "s3",
-        aws_access_key_id=aws_access_key,
-        aws_secret_access_key=aws_secret_key,
-        endpoint_url=aws_endpoint_url,
-        region_name=aws_region,
+        aws_access_key_id=key_id,
+        aws_secret_access_key=secret_key,
+        region_name=region,
+        endpoint_url=endpoint_url
     )
 
-    s3_client.upload_file(file_path, s3_bucket, destination_filename)
-
-    # Build response URL (Handles standard AWS S3 as well as Cloudflare R2 / Custom S3 endpoints)
-    if aws_endpoint_url:
-        output_url = f"{aws_endpoint_url.rstrip('/')}/{s3_bucket}/{destination_filename}"
-    else:
-        output_url = f"https://{s3_bucket}.s3.{aws_region}.amazonaws.com/{destination_filename}"
-
-    return output_url
+    client.upload_file(local_path, bucket, s3_key)
+    return client.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": bucket, "Key": s3_key},
+        ExpiresIn=3600
+    )
 
 
 def process_video_sync(job: dict) -> dict:
