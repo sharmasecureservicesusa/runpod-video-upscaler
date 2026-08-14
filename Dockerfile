@@ -31,8 +31,8 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-cache-dir --no-deps basicsr
 RUN pip install --no-cache-dir --no-deps realesrgan
 
-# PATCH: Bulletproof BasicSR TorchVision 0.16+ functional_tensor fix
-RUN python -c "import basicsr, os; p = os.path.join(os.path.dirname(basicsr.__file__), 'data', 'degradations.py'); open(p, 'w').write(open(p).read().replace('functional_tensor', 'functional'))"
+# PATCH: Fix BasicSR functional_tensor import error directly on disk (no python import)
+RUN find /usr/local/lib/python* -path "*/basicsr/*" -name "*.py" -exec sed -i 's/functional_tensor/functional/g' {} +
 
 # 5. Lock NumPy to 1.26.4
 RUN pip uninstall -y numpy && pip install --force-reinstall --no-cache-dir "numpy==1.26.4"
