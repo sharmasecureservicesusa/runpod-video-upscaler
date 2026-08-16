@@ -13,23 +13,29 @@ import runpod
 executor = ThreadPoolExecutor(max_workers=os.cpu_count())
 
 print("Available Environment Variable Keys:", list(os.environ.keys()))
-def download_video(url: str, target_path: str) -> None:
-    """Downloads an input video with validation to prevent bad or HTML downloads."""
-    try:
-        response = requests.get(url, stream=True, timeout=60)
-        response.raise_for_status()
-    except requests.RequestException as e:
-        raise ValueError(f"Failed to download input video from URL '{url}': {e}") from e
-
-    content_type = response.headers.get("content-type", "").lower()
-    if "text/html" in content_type:
-        raise ValueError(
-            f"The provided URL '{url}' returned an HTML page instead of a video. "
-            "Please check if the link requires authentication or has expired."
+def download_video(job_input: dict, local_destination: str):
+    video_url = job_input.get("video_url")
+    s3_bucket = job_input.get("s3_bucket") or os.getenv("S3_BUCKET")
+    
+    # If S3 credentials are standard, download private object using boto3 S3 client
+    if s3_bucket and "nebius.cloud" in video_url and "?" not in video_url:
+        s3_key = video_url.split(f"{s3_bucket}/")[-1]
+        
+        s3_client = boto3.client(
+            "s3",
+            aws_access_key_id=job_input.get("aws_access_key_id") or os.getenv("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=job_input.get("aws_secret_access_key") or os.getenv("AWS_SECRET_ACCESS_KEY"),
+            region_name=job_input.get("aws_region") or os.getenv("AWS_REGION", "eu-north1"),
+            endpoint_url=job_input.get("s3_endpoint_url") or os.getenv("S3_ENDPOINT_URL", "https://storage.eu-north1.nebius.cloud:443")
         )
+        s3_client.download_file(s3_bucket, s3_key, local_destination)
+        return
 
-    with open(target_path, "wb") as f:
-        for chunk in response.iter_content(chunk_size=8192):
+    # Fallback to requests for presigned or public URLs
+    res = requests.get(video_url, stream=True)
+    res.raise_for_status()
+    with open(local_destination, "wb") as f:
+        for chunk in res.iter_content(chunk_size=8192):
             f.write(chunk)
 
     if not os.path.exists(target_path) or os.path.getsize(target_path) == 0:
