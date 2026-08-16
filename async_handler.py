@@ -21,6 +21,7 @@ def download_video(job_input: dict, local_destination: str):
     """
     Downloads video chunks directly using boto3.get_object() for Nebius S3,
     bypassing s3transfer's HeadObject pre-check to prevent 403 errors.
+    Automatically strips explicit :443 ports to prevent SigV4 signature mismatches.
     """
     video_url = job_input.get("video_url", "")
     if not video_url:
@@ -29,10 +30,13 @@ def download_video(job_input: dict, local_destination: str):
     s3_bucket = job_input.get("s3_bucket") or os.getenv("S3_BUCKET")
     key_id = job_input.get("aws_access_key_id") or os.getenv("AWS_ACCESS_KEY_ID")
     secret_key = job_input.get("aws_secret_access_key") or os.getenv("AWS_SECRET_ACCESS_KEY")
-    endpoint_url = job_input.get("s3_endpoint_url") or os.getenv("S3_ENDPOINT_URL", "https://storage.eu-north1.nebius.cloud:443")
+    
+    # Strip :443 port if present to maintain SigV4 Host header consistency
+    raw_endpoint = job_input.get("s3_endpoint_url") or os.getenv("S3_ENDPOINT_URL", "https://storage.eu-north1.nebius.cloud")
+    endpoint_url = raw_endpoint.replace(":443", "").rstrip("/")
     region = job_input.get("aws_region") or os.getenv("AWS_REGION", "eu-north1")
 
-    clean_url = video_url.split("?")[0]
+    clean_url = video_url.split("?")[0].replace(":443", "")
     is_nebius = "nebius.cloud" in clean_url or clean_url.startswith("s3://") or (s3_bucket and s3_bucket in clean_url)
 
     if is_nebius:
@@ -55,7 +59,7 @@ def download_video(job_input: dict, local_destination: str):
                 parsed = urlparse(clean_url)
                 s3_key = parsed.path.lstrip("/")
 
-        print(f"Streaming directly via boto3 get_object: bucket='{bucket}', key='{s3_key}'", flush=True)
+        print(f"Streaming directly via boto3 get_object: endpoint='{endpoint_url}', bucket='{bucket}', key='{s3_key}'", flush=True)
 
         s3_client = boto3.client(
             "s3",
@@ -66,7 +70,7 @@ def download_video(job_input: dict, local_destination: str):
         )
 
         try:
-            # Direct GET request (bypasses HeadObject)
+            # Direct GET request (bypasses HeadObject check)
             response = s3_client.get_object(Bucket=bucket, Key=s3_key)
             with open(local_destination, "wb") as f:
                 for chunk in response["Body"].iter_chunks(chunk_size=1024 * 1024):
@@ -143,7 +147,8 @@ def get_video_info(input_video_path: str):
 def upload_to_s3(local_path: str, s3_key: str, job_input: dict) -> str:
     """Uploads processing output back to S3/Nebius and returns a presigned GET URL."""
     bucket = job_input.get("s3_bucket") or os.getenv("S3_BUCKET")
-    endpoint_url = job_input.get("s3_endpoint_url") or os.getenv("S3_ENDPOINT_URL", "https://storage.eu-north1.nebius.cloud:443")
+    raw_endpoint = job_input.get("s3_endpoint_url") or os.getenv("S3_ENDPOINT_URL", "https://storage.eu-north1.nebius.cloud")
+    endpoint_url = raw_endpoint.replace(":443", "").rstrip("/")
     key_id = job_input.get("aws_access_key_id") or os.getenv("AWS_ACCESS_KEY_ID")
     secret_key = job_input.get("aws_secret_access_key") or os.getenv("AWS_SECRET_ACCESS_KEY")
     region = job_input.get("aws_region") or os.getenv("AWS_REGION", "eu-north1")
@@ -189,7 +194,7 @@ def process_video_sync(job: dict) -> dict:
         in_w, in_h, fps = get_video_info(str(input_video))
 
         # Step 3: Video processing / upscaling
-        # (Replace output_video placeholder with model execution as required)
+        # (Replace placeholder with model execution as required)
         if not output_video.exists():
             output_video = input_video
 
