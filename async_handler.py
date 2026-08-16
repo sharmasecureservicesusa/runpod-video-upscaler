@@ -5,6 +5,7 @@ import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from urllib.parse import urlparse
 import boto3
 import requests
 import runpod
@@ -17,39 +18,40 @@ print("Available Environment Variable Keys:", list(os.environ.keys()), flush=Tru
 
 def download_video(job_input: dict, local_destination: str):
     """
-    Downloads video chunks automatically:
-    - If URL is Signed (contains '?'), downloads via HTTP requests.get()
-    - If URL is Unsigned (no '?') or an s3:// URI, downloads via boto3 S3 client
+    Downloads video chunks automatically using boto3 whenever Nebius S3 credentials are present.
+    Strips presigned query strings if needed to avoid Host header SigV4 mismatches over HTTP.
     """
     video_url = job_input.get("video_url", "")
     if not video_url:
         raise ValueError("Missing 'video_url' in job_input.")
 
     s3_bucket = job_input.get("s3_bucket") or os.getenv("S3_BUCKET")
-    
-    # Check if URL contains query parameters ('?' indicates a presigned URL)
-    is_signed = "?" in video_url
-    is_s3_uri = video_url.startswith("s3://")
+    key_id = job_input.get("aws_access_key_id") or os.getenv("AWS_ACCESS_KEY_ID")
+    secret_key = job_input.get("aws_secret_access_key") or os.getenv("AWS_SECRET_ACCESS_KEY")
+    endpoint_url = job_input.get("s3_endpoint_url") or os.getenv("S3_ENDPOINT_URL", "https://storage.eu-north1.nebius.cloud:443")
+    region = job_input.get("aws_region") or os.getenv("AWS_REGION", "eu-north1")
 
-    # Use boto3 if it's an unsigned S3 URL or an s3:// URI
-    if (is_s3_uri or not is_signed) and (s3_bucket or is_s3_uri):
+    is_nebius = "nebius.cloud" in video_url or video_url.startswith("s3://") or (s3_bucket and s3_bucket in video_url)
+
+    # Always use boto3 if Nebius credentials and bucket are available
+    if is_nebius and key_id and secret_key:
         try:
-            if is_s3_uri:
-                parts = video_url.replace("s3://", "").split("/", 1)
+            # Strip query parameters (?X-Amz-...) if present
+            clean_url = video_url.split("?")[0]
+
+            if clean_url.startswith("s3://"):
+                parts = clean_url.replace("s3://", "").split("/", 1)
                 bucket = parts[0]
                 s3_key = parts[1] if len(parts) > 1 else ""
             else:
                 bucket = s3_bucket
-                # Extract S3 Key from URL
-                if f"{bucket}/" in video_url:
-                    s3_key = video_url.split(f"{bucket}/")[-1]
+                if f"{bucket}/" in clean_url:
+                    s3_key = clean_url.split(f"{bucket}/")[-1]
                 else:
-                    s3_key = video_url.split("/")[-1]
+                    parsed = urlparse(clean_url)
+                    s3_key = parsed.path.lstrip("/")
 
-            key_id = job_input.get("aws_access_key_id") or os.getenv("AWS_ACCESS_KEY_ID")
-            secret_key = job_input.get("aws_secret_access_key") or os.getenv("AWS_SECRET_ACCESS_KEY")
-            region = job_input.get("aws_region") or os.getenv("AWS_REGION", "eu-north1")
-            endpoint_url = job_input.get("s3_endpoint_url") or os.getenv("S3_ENDPOINT_URL", "https://storage.eu-north1.nebius.cloud:443")
+            print(f"Downloading directly via boto3 S3 client: bucket='{bucket}', key='{s3_key}'", flush=True)
 
             s3_client = boto3.client(
                 "s3",
@@ -58,30 +60,22 @@ def download_video(job_input: dict, local_destination: str):
                 region_name=region,
                 endpoint_url=endpoint_url
             )
-            print(f"Downloading unsigned object via boto3: bucket='{bucket}', key='{s3_key}'", flush=True)
             s3_client.download_file(bucket, s3_key, local_destination)
 
-        except Exception as e:
-            # Fallback to HTTP request if boto3 fails and URL starts with http
-            if video_url.startswith("http"):
-                print(f"boto3 download failed ({e}), attempting direct HTTP request...", flush=True)
-                res = requests.get(video_url, stream=True)
-                res.raise_for_status()
-                with open(local_destination, "wb") as f:
-                    for chunk in res.iter_content(chunk_size=8192):
-                        f.write(chunk)
-            else:
-                raise e
-    else:
-        # Download presigned / public HTTP URL
-        print(f"Downloading signed/public URL via HTTP requests: {video_url[:60]}...", flush=True)
-        res = requests.get(video_url, stream=True)
-        res.raise_for_status()
-        with open(local_destination, "wb") as f:
-            for chunk in res.iter_content(chunk_size=8192):
-                f.write(chunk)
+            if os.path.exists(local_destination) and os.path.getsize(local_destination) > 0:
+                return
 
-    # Validate that downloaded file exists and is non-empty
+        except Exception as e:
+            print(f"boto3 download attempt failed ({e}), attempting fallback HTTP request...", flush=True)
+
+    # Fallback for public / non-S3 HTTP URLs
+    print(f"Downloading via HTTP requests: {video_url[:80]}...", flush=True)
+    res = requests.get(video_url, stream=True)
+    res.raise_for_status()
+    with open(local_destination, "wb") as f:
+        for chunk in res.iter_content(chunk_size=8192):
+            f.write(chunk)
+
     if not os.path.exists(local_destination) or os.path.getsize(local_destination) == 0:
         raise ValueError(f"Downloaded video file is empty (0 bytes) from URL: {video_url}")
 
@@ -172,17 +166,17 @@ def process_video_sync(job: dict) -> dict:
     output_video = work_dir / "output.mp4"
 
     try:
-        # Step 1: Download (Passes job_input dictionary)
+        # Step 1: Download video chunk
         download_video(job_input, str(input_video))
 
-        # Step 2: Extract details
+        # Step 2: Extract video details via ffprobe
         in_w, in_h, fps = get_video_info(str(input_video))
 
-        # Step 3: Upscaler logic (placeholder)
+        # Step 3: Video processing / upscaling
         if not output_video.exists():
             output_video = input_video
 
-        # Step 4: Upload result to S3
+        # Step 4: Upload result back to Nebius S3
         output_url = upload_to_s3(str(output_video), f"{job_id}_upscaled.mp4", job_input)
 
         return {
