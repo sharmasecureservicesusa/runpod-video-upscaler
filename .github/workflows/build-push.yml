@@ -52,35 +52,111 @@ jobs:
             ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+
       - name: Update RunPod Serverless Template
         env:
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
           RUNPOD_TEMPLATE_ID: ${{ secrets.RUNPOD_TEMPLATE_ID }}
           IMAGE_TAG: "ghcr.io/${{ github.repository }}:${{ github.sha }}"
         run: |
-          echo "Updating RunPod Template ($RUNPOD_TEMPLATE_ID) to tag: $IMAGE_TAG"
+          python3 - << 'EOF'
+          import os
+          import json
+          import urllib.request
 
-          PAYLOAD=$(jq -n \
-            --arg id "$RUNPOD_TEMPLATE_ID" \
-            --arg img "$IMAGE_TAG" \
-            '{
-              query: "mutation saveTemplate($input: SaveTemplateInput!) { saveTemplate(input: $input) { id imageName } }",
-              variables: {
-                input: {
-                  id: $id,
-                  imageName: $img
+          api_key = os.environ["RUNPOD_API_KEY"]
+          template_id = os.environ["RUNPOD_TEMPLATE_ID"]
+          new_image = os.environ["IMAGE_TAG"]
+
+          print(f"Fetching current configuration for template ID: {template_id}...")
+
+          # 1. Fetch existing template settings
+          query_get = """
+          query {
+            myself {
+              podTemplates {
+                id
+                name
+                imageName
+                containerDiskInGb
+                dockerArgs
+                env {
+                  key
+                  value
                 }
+                volumeInGb
+                isServerless
+                containerRegistryAuthId
+                readme
+                ports
               }
-            }')
+            }
+          }
+          """
 
-          RESPONSE=$(curl -s -X POST \
-            -H "Content-Type: application/json" \
-            -d "$PAYLOAD" \
-            "https://api.runpod.io/graphql?api_key=${RUNPOD_API_KEY}")
+          req = urllib.request.Request(
+              f"https://api.runpod.io/graphql?api_key={api_key}",
+              data=json.dumps({"query": query_get}).encode("utf-8"),
+              headers={"Content-Type": "application/json"}
+          )
 
-          echo "RunPod API Response: $RESPONSE"
+          with urllib.request.urlopen(req) as response:
+              res = json.loads(response.read().decode("utf-8"))
 
-          if echo "$RESPONSE" | grep -q '"errors"'; then
-            echo "Error updating RunPod template."
-            exit 1
-          fi
+          if "errors" in res:
+              raise Exception(f"Failed to fetch templates: {res['errors']}")
+
+          templates = res.get("data", {}).get("myself", {}).get("podTemplates", [])
+          target = next((t for t in templates if t["id"] == template_id), None)
+
+          if not target:
+              raise Exception(f"Template ID '{template_id}' not found in your RunPod account.")
+
+          print(f"Found template '{target.get('name')}'. Updating image: '{target.get('imageName')}' -> '{new_image}'")
+
+          # 2. Build full input payload with required fields
+          input_data = {
+              "id": target["id"],
+              "name": target.get("name", "Serverless Template"),
+              "imageName": new_image,
+              "containerDiskInGb": target.get("containerDiskInGb") or 10,
+              "dockerArgs": target.get("dockerArgs") if target.get("dockerArgs") is not None else "",
+              "env": target.get("env") or [],
+              "volumeInGb": target.get("volumeInGb") if target.get("volumeInGb") is not None else 0,
+              "isServerless": target.get("isServerless", True)
+          }
+
+          if target.get("containerRegistryAuthId"):
+              input_data["containerRegistryAuthId"] = target["containerRegistryAuthId"]
+          if target.get("readme"):
+              input_data["readme"] = target["readme"]
+          if target.get("ports"):
+              input_data["ports"] = target["ports"]
+
+          # 3. Submit complete SaveTemplateInput mutation
+          mutation_save = """
+          mutation saveTemplate($input: SaveTemplateInput!) {
+            saveTemplate(input: $input) {
+              id
+              name
+              imageName
+            }
+          }
+          """
+
+          req_save = urllib.request.Request(
+              f"https://api.runpod.io/graphql?api_key={api_key}",
+              data=json.dumps({"query": mutation_save, "variables": {"input": input_data}}).encode("utf-8"),
+              headers={"Content-Type": "application/json"}
+          )
+
+          with urllib.request.urlopen(req_save) as response:
+              res_save = json.loads(response.read().decode("utf-8"))
+
+          if "errors" in res_save:
+              raise Exception(f"RunPod API Error: {res_save['errors']}")
+
+          updated = res_save.get("data", {}).get("saveTemplate", {})
+          print(f"Successfully updated RunPod template '{updated.get('name')}' ({updated.get('id')}) to image: {updated.get('imageName')}")
+          EOF
