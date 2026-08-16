@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlparse
 import boto3
+import botocore.exceptions
 import requests
 import runpod
 
@@ -18,9 +19,8 @@ print("Available Environment Variable Keys:", list(os.environ.keys()), flush=Tru
 
 def download_video(job_input: dict, local_destination: str):
     """
-    Downloads video chunks automatically:
-    - Uses boto3 S3 client for private Nebius S3 objects.
-    - Uses HTTP requests only for non-S3 public URLs.
+    Downloads video chunks directly using boto3.get_object() for Nebius S3,
+    bypassing s3transfer's HeadObject pre-check to prevent 403 errors.
     """
     video_url = job_input.get("video_url", "")
     if not video_url:
@@ -35,14 +35,14 @@ def download_video(job_input: dict, local_destination: str):
     clean_url = video_url.split("?")[0]
     is_nebius = "nebius.cloud" in clean_url or clean_url.startswith("s3://") or (s3_bucket and s3_bucket in clean_url)
 
-    # Always handle Nebius S3 downloads via boto3
     if is_nebius:
         if not key_id or not secret_key:
             raise ValueError(
-                f"Nebius S3 URL detected ({clean_url}), but missing S3 credentials! "
-                f"aws_access_key_id present: {bool(key_id)}, aws_secret_access_key present: {bool(secret_key)}."
+                f"Nebius S3 URL detected, but missing credentials! "
+                f"Key present: {bool(key_id)}, Secret present: {bool(secret_key)}"
             )
 
+        # Parse Bucket and S3 Key
         if clean_url.startswith("s3://"):
             parts = clean_url.replace("s3://", "").split("/", 1)
             bucket = parts[0]
@@ -55,7 +55,7 @@ def download_video(job_input: dict, local_destination: str):
                 parsed = urlparse(clean_url)
                 s3_key = parsed.path.lstrip("/")
 
-        print(f"Downloading via boto3 S3 client: bucket='{bucket}', key='{s3_key}'", flush=True)
+        print(f"Streaming directly via boto3 get_object: bucket='{bucket}', key='{s3_key}'", flush=True)
 
         s3_client = boto3.client(
             "s3",
@@ -65,14 +65,25 @@ def download_video(job_input: dict, local_destination: str):
             endpoint_url=endpoint_url
         )
 
-        # Download directly to destination path
-        s3_client.download_file(bucket, s3_key, local_destination)
+        try:
+            # Direct GET request (bypasses HeadObject)
+            response = s3_client.get_object(Bucket=bucket, Key=s3_key)
+            with open(local_destination, "wb") as f:
+                for chunk in response["Body"].iter_chunks(chunk_size=1024 * 1024):
+                    f.write(chunk)
 
-        if not os.path.exists(local_destination) or os.path.getsize(local_destination) == 0:
-            raise ValueError(f"boto3 downloaded an empty file (0 bytes) for key: '{s3_key}' in bucket '{bucket}'")
-        return
+            if os.path.exists(local_destination) and os.path.getsize(local_destination) > 0:
+                print(f"Download complete: {os.path.getsize(local_destination)} bytes saved to {local_destination}", flush=True)
+                return
 
-    # Handle public non-S3 HTTP URLs
+        except botocore.exceptions.ClientError as err:
+            error_code = err.response.get("Error", {}).get("Code", "Unknown")
+            raise ValueError(
+                f"Nebius S3 get_object failed (Code: {error_code}) for bucket='{bucket}', key='{s3_key}'. "
+                f"Verify key exists in S3 and credentials have read access. Original error: {err}"
+            ) from err
+
+    # Fallback for public non-S3 HTTP URLs
     print(f"Downloading public HTTP URL: {video_url[:80]}...", flush=True)
     res = requests.get(video_url, stream=True)
     res.raise_for_status()
@@ -130,6 +141,7 @@ def get_video_info(input_video_path: str):
 
 
 def upload_to_s3(local_path: str, s3_key: str, job_input: dict) -> str:
+    """Uploads processing output back to S3/Nebius and returns a presigned GET URL."""
     bucket = job_input.get("s3_bucket") or os.getenv("S3_BUCKET")
     endpoint_url = job_input.get("s3_endpoint_url") or os.getenv("S3_ENDPOINT_URL", "https://storage.eu-north1.nebius.cloud:443")
     key_id = job_input.get("aws_access_key_id") or os.getenv("AWS_ACCESS_KEY_ID")
@@ -177,11 +189,13 @@ def process_video_sync(job: dict) -> dict:
         in_w, in_h, fps = get_video_info(str(input_video))
 
         # Step 3: Video processing / upscaling
+        # (Replace output_video placeholder with model execution as required)
         if not output_video.exists():
             output_video = input_video
 
         # Step 4: Upload result back to Nebius S3
-        output_url = upload_to_s3(str(output_video), f"{job_id}_upscaled.mp4", job_input)
+        upscaled_s3_key = job_input.get("upscaled_s3_key") or f"{job_id}_upscaled.mp4"
+        output_url = upload_to_s3(str(output_video), upscaled_s3_key, job_input)
 
         return {
             "output_url": output_url,
@@ -191,7 +205,7 @@ def process_video_sync(job: dict) -> dict:
         }
 
     finally:
-        # Step 5: Clean up temp directory
+        # Step 5: Clean up temp directory to conserve worker disk space
         if work_dir.exists():
             shutil.rmtree(work_dir, ignore_errors=True)
 
