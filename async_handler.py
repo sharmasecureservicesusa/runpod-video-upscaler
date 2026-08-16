@@ -18,8 +18,9 @@ print("Available Environment Variable Keys:", list(os.environ.keys()), flush=Tru
 
 def download_video(job_input: dict, local_destination: str):
     """
-    Downloads video chunks automatically using boto3 whenever Nebius S3 credentials are present.
-    Strips presigned query strings if needed to avoid Host header SigV4 mismatches over HTTP.
+    Downloads video chunks automatically:
+    - Uses boto3 S3 client for private Nebius S3 objects.
+    - Uses HTTP requests only for non-S3 public URLs.
     """
     video_url = job_input.get("video_url", "")
     if not video_url:
@@ -31,45 +32,48 @@ def download_video(job_input: dict, local_destination: str):
     endpoint_url = job_input.get("s3_endpoint_url") or os.getenv("S3_ENDPOINT_URL", "https://storage.eu-north1.nebius.cloud:443")
     region = job_input.get("aws_region") or os.getenv("AWS_REGION", "eu-north1")
 
-    is_nebius = "nebius.cloud" in video_url or video_url.startswith("s3://") or (s3_bucket and s3_bucket in video_url)
+    clean_url = video_url.split("?")[0]
+    is_nebius = "nebius.cloud" in clean_url or clean_url.startswith("s3://") or (s3_bucket and s3_bucket in clean_url)
 
-    # Always use boto3 if Nebius credentials and bucket are available
-    if is_nebius and key_id and secret_key:
-        try:
-            # Strip query parameters (?X-Amz-...) if present
-            clean_url = video_url.split("?")[0]
-
-            if clean_url.startswith("s3://"):
-                parts = clean_url.replace("s3://", "").split("/", 1)
-                bucket = parts[0]
-                s3_key = parts[1] if len(parts) > 1 else ""
-            else:
-                bucket = s3_bucket
-                if f"{bucket}/" in clean_url:
-                    s3_key = clean_url.split(f"{bucket}/")[-1]
-                else:
-                    parsed = urlparse(clean_url)
-                    s3_key = parsed.path.lstrip("/")
-
-            print(f"Downloading directly via boto3 S3 client: bucket='{bucket}', key='{s3_key}'", flush=True)
-
-            s3_client = boto3.client(
-                "s3",
-                aws_access_key_id=key_id,
-                aws_secret_access_key=secret_key,
-                region_name=region,
-                endpoint_url=endpoint_url
+    # Always handle Nebius S3 downloads via boto3
+    if is_nebius:
+        if not key_id or not secret_key:
+            raise ValueError(
+                f"Nebius S3 URL detected ({clean_url}), but missing S3 credentials! "
+                f"aws_access_key_id present: {bool(key_id)}, aws_secret_access_key present: {bool(secret_key)}."
             )
-            s3_client.download_file(bucket, s3_key, local_destination)
 
-            if os.path.exists(local_destination) and os.path.getsize(local_destination) > 0:
-                return
+        if clean_url.startswith("s3://"):
+            parts = clean_url.replace("s3://", "").split("/", 1)
+            bucket = parts[0]
+            s3_key = parts[1] if len(parts) > 1 else ""
+        else:
+            bucket = s3_bucket
+            if f"{bucket}/" in clean_url:
+                s3_key = clean_url.split(f"{bucket}/")[-1]
+            else:
+                parsed = urlparse(clean_url)
+                s3_key = parsed.path.lstrip("/")
 
-        except Exception as e:
-            print(f"boto3 download attempt failed ({e}), attempting fallback HTTP request...", flush=True)
+        print(f"Downloading via boto3 S3 client: bucket='{bucket}', key='{s3_key}'", flush=True)
 
-    # Fallback for public / non-S3 HTTP URLs
-    print(f"Downloading via HTTP requests: {video_url[:80]}...", flush=True)
+        s3_client = boto3.client(
+            "s3",
+            aws_access_key_id=key_id,
+            aws_secret_access_key=secret_key,
+            region_name=region,
+            endpoint_url=endpoint_url
+        )
+
+        # Download directly to destination path
+        s3_client.download_file(bucket, s3_key, local_destination)
+
+        if not os.path.exists(local_destination) or os.path.getsize(local_destination) == 0:
+            raise ValueError(f"boto3 downloaded an empty file (0 bytes) for key: '{s3_key}' in bucket '{bucket}'")
+        return
+
+    # Handle public non-S3 HTTP URLs
+    print(f"Downloading public HTTP URL: {video_url[:80]}...", flush=True)
     res = requests.get(video_url, stream=True)
     res.raise_for_status()
     with open(local_destination, "wb") as f:
