@@ -52,3 +52,35 @@ jobs:
             ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: Update RunPod Serverless Template
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          RUNPOD_TEMPLATE_ID: ${{ secrets.RUNPOD_TEMPLATE_ID }}
+          IMAGE_TAG: "ghcr.io/${{ github.repository }}:${{ github.sha }}"
+        run: |
+          echo "Updating RunPod Template ($RUNPOD_TEMPLATE_ID) to tag: $IMAGE_TAG"
+
+          PAYLOAD=$(jq -n \
+            --arg id "$RUNPOD_TEMPLATE_ID" \
+            --arg img "$IMAGE_TAG" \
+            '{
+              query: "mutation saveTemplate($input: SaveTemplateInput!) { saveTemplate(input: $input) { id imageName } }",
+              variables: {
+                input: {
+                  id: $id,
+                  imageName: $img
+                }
+              }
+            }')
+
+          RESPONSE=$(curl -s -X POST \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "https://api.runpod.io/graphql?api_key=${RUNPOD_API_KEY}")
+
+          echo "RunPod API Response: $RESPONSE"
+
+          if echo "$RESPONSE" | grep -q '"errors"'; then
+            echo "Error updating RunPod template."
+            exit 1
+          fi
